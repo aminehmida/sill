@@ -1,5 +1,13 @@
 # Sill
 
+> **This is Amine Hmida's fork of [Saffsanity/sill](https://github.com/Saffsanity/sill), used for experiments.**
+> The `experiments` branch carries upstream's `main` plus fixes I am trying out before they are
+> released, at the moment [PR #151](https://github.com/Saffsanity/sill/pull/151) (the Mac wakes its
+> display and lock screen for a connecting device, [#134](https://github.com/Saffsanity/sill/issues/134)).
+> Nothing here is an official release: install Sill from [getsill.app](https://getsill.app) unless
+> you know why you want this build. Sill is by Noah Saffer.
+
+
 Any window from your Mac, on your iPhone and iPad.
 
 Sill shows a window from your Mac, or the whole desktop, on your iPhone or
