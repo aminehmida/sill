@@ -151,6 +151,10 @@ final class StreamServer {
         /// Its hello said it shows a Mac's off-console view (`Hello.offConsoleView`; docs/off-console-plan.md):
         /// it is sent the view's window list (`broadcastList`), every other device the plain one.
         var viewsOffConsole = false
+        /// Its hello said it shows its keyboard by itself (`Hello.textFocus`): it is sent kind 64.
+        var wantsTextFocus = false
+        /// The last kind 64 sent to it, so a poll that reads the same focus sends nothing.
+        var lastTextFocus: TextFocus?
         init(_ c: NWConnection) { connection = c }
     }
 
@@ -1315,6 +1319,8 @@ final class StreamServer {
         // The Mac's sound goes only to a device that said it plays a codec this host makes.
         client.audioCodec = AudioCodec.choose(offered: hello.audio)
         client.viewsOffConsole = (hello.offConsoleView ?? 0) >= LockedMac.viewGeneration
+        client.wantsTextFocus = (hello.textFocus ?? 0) >= TextFocus.generation
+        if client.wantsTextFocus { countTextFocusDevice(1) }
         updateAudioListeners()
         onClientHello?(c, hello)
     }
@@ -1419,6 +1425,7 @@ final class StreamServer {
         updateTicking()
         updateSweep()
         if client.audioCodec != nil { updateAudioListeners() }
+        if client.wantsTextFocus { countTextFocusDevice(-1) }
     }
 
     /// The source is changing: forget the old parameter sets and make every client wait for
@@ -1485,6 +1492,27 @@ final class StreamServer {
         queue.async { [self] in
             for client in clients.values where client.connection.state == .ready {
                 send(client.viewsOffConsole ? viewData : plainData, to: client)
+            }
+        }
+    }
+
+    /// Devices connected whose hello asked for kind 64; read on any queue (the coordinator's poll).
+    private var textFocusDevices = 0
+    private let textFocusLock = NSLock()
+    var hasTextFocusDevices: Bool { textFocusLock.lock(); defer { textFocusLock.unlock() }; return textFocusDevices > 0 }
+    private func countTextFocusDevice(_ delta: Int) { textFocusLock.lock(); textFocusDevices += delta; textFocusLock.unlock() }
+
+    /// Kind 64 to every device that asked for it whose last one said otherwise, and to `forcing` whatever
+    /// its last one said: that device clicked or typed, so a field it clicked brings its keyboard up again
+    /// even after the person put it away. Thread-safe.
+    func sendTextFocus(_ focus: TextFocus, forcing: NWConnection? = nil) {
+        let data = StreamMessage(kind: .textFocus, timestamp: Date().timeIntervalSince1970, isKeyframe: false,
+                                 payload: Wire.encode(focus)).serialized()
+        queue.async { [self] in
+            for client in clients.values where client.connection.state == .ready && client.wantsTextFocus {
+                guard client.lastTextFocus != focus || client.connection === forcing else { continue }
+                client.lastTextFocus = focus
+                send(data, to: client)
             }
         }
     }

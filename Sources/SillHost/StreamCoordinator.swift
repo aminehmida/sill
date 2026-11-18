@@ -389,6 +389,10 @@ package final class StreamCoordinator {
     private var menuFrontCheckPending = false
     /// Under the AppKit loop, while a device subscribes: app activations on the Mac.
     private var frontmostObserver: NSObjectProtocol?
+    /// Kind 64 (TextFocus): the Accessibility reads, the poll while a device that asked is connected,
+    /// and the checks a device's click or key asks for (`textFocusMayChange`).
+    private let textFocusReader = TextFocusReader()
+    private var textFocusPoll: Task<Void, Never>?
 
     /// `config` is validated, and its virtual display forced off without the AppKit loop, which
     /// the display needs (VirtualDisplay.swift, "Event loop"). `appKitLoop`: see the property.
@@ -725,6 +729,9 @@ package final class StreamCoordinator {
         // they always did; a remote device keeps its paired name meanwhile.
         server.onClientHello = { [weak self] connection, hello in
             let id = ObjectIdentifier(connection)
+            if (hello.textFocus ?? 0) >= TextFocus.generation {
+                Task { @MainActor in self?.startTextFocusPoll() }
+            }
             // A device that shows the off-console view (docs/off-console-plan.md): its hello is read after its first
             // window list went out (the plain one: the server knew no better yet), so while the view applies it is
             // sent the view's list now (StreamServer picks it by the hello, as every list from here on).
@@ -1276,6 +1283,7 @@ package final class StreamCoordinator {
             if !synthetic { raiseIfInteracting(event) }
             deliver(event, in: rect, from: device)
             desktopInputMayActivate(event)
+            textFocusMayChange(event, from: connection)
         case .gesture:
             // A three- or four-finger gesture (docs/trackpad-gestures-plan.md §7.4), which the Mac
             // turns into its own shortcut. At most `gesturesPerSecond` a second per connection: a
@@ -2886,6 +2894,56 @@ package final class StreamCoordinator {
             self.menuFrontCheckPending = false
             self.menuFrontCheckAt = CFAbsoluteTimeGetCurrent()
             if self.active == .desktop { self.menuTargetChanged() }
+        }
+    }
+
+    // MARK: The focused text field (kind 64, TextFocus.swift)
+    //
+    // While a device whose hello asked for it is connected, the streamed app's focused element is read
+    // every half second, and 0.15 s and 0.45 s after a device's click or key, so its keyboard comes up as
+    // the click lands in a field. StreamServer sends a device only a change.
+
+    /// The app whose focus counts: the menus' target (the streamed window's app, or the Desktop's
+    /// frontmost; none while locked, nothing streaming, or Sill), and only while it is frontmost, since
+    /// typing goes to the frontmost app.
+    private func textFocusTarget() -> pid_t? {
+        guard let pid = menuTarget()?.pid else { return nil }
+        return Self.activePID(trustAppKit: appKitLoop) == pid ? pid : nil
+    }
+
+    /// `forcing`: the device whose click or key asked for this check, sent the answer even unchanged.
+    private func checkTextFocus(forcing: NWConnection? = nil) {
+        guard server.hasTextFocusDevices else { return }
+        guard let pid = textFocusTarget() else { server.sendTextFocus(.none, forcing: forcing); return }
+        textFocusReader.read(pid: pid) { [server] focus in server.sendTextFocus(focus, forcing: forcing) }
+    }
+
+    private func startTextFocusPoll() {
+        guard textFocusPoll == nil else { return }
+        textFocusPoll = Task { @MainActor in
+            while !Task.isCancelled, self.server.hasTextFocusDevices {
+                self.checkTextFocus()
+                try? await Task.sleep(for: .milliseconds(500))
+            }
+            self.textFocusPoll = nil
+        }
+    }
+
+    private func textFocusMayChange(_ event: InputEvent, from connection: NWConnection) {
+        guard server.hasTextFocusDevices else { return }
+        // A click forces its answer to the device (a field clicked again brings the keyboard back); a key
+        // (Tab to the next field) sends only a change, so a hardware keyboard's typing never raises it.
+        let click: Bool
+        switch event {
+        case .pointer(let action, _, _): guard action == .leftUp else { return }; click = true
+        case .key(_, let down, _): guard down else { return }; click = false
+        default: return
+        }
+        Task { @MainActor in
+            try? await Task.sleep(for: .milliseconds(150))
+            self.checkTextFocus(forcing: click ? connection : nil)
+            try? await Task.sleep(for: .milliseconds(300))
+            self.checkTextFocus()
         }
     }
 
