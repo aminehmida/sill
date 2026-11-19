@@ -389,10 +389,18 @@ package final class StreamCoordinator {
     private var menuFrontCheckPending = false
     /// Under the AppKit loop, while a device subscribes: app activations on the Mac.
     private var frontmostObserver: NSObjectProtocol?
-    /// Kind 64 (TextFocus): the Accessibility reads, the poll while a device that asked is connected,
-    /// and the checks a device's click or key asks for (`textFocusMayChange`).
-    private let textFocusReader = TextFocusReader()
+    /// Kind 64 (TextFocus): the Accessibility reads and the observer of the app read last; a focus the
+    /// observer reads goes out only while that app is still the target.
+    private lazy var textFocusReader = TextFocusReader { [weak self] pid, focus in
+        Task { @MainActor in
+            guard let self, self.server.hasTextFocusDevices, self.textFocusTarget() == pid else { return }
+            self.server.sendTextFocus(focus)
+        }
+    }
+    /// The safety net under the observer while a device that asked is connected, and, under the AppKit
+    /// loop, app activations on the Mac (a new app to observe at once).
     private var textFocusPoll: Task<Void, Never>?
+    private var textFocusActivation: NSObjectProtocol?
 
     /// `config` is validated, and its virtual display forced off without the AppKit loop, which
     /// the display needs (VirtualDisplay.swift, "Event loop"). `appKitLoop`: see the property.
@@ -2899,9 +2907,11 @@ package final class StreamCoordinator {
 
     // MARK: The focused text field (kind 64, TextFocus.swift)
     //
-    // While a device whose hello asked for it is connected, the streamed app's focused element is read
-    // every half second, and 0.15 s and 0.45 s after a device's click or key, so its keyboard comes up as
-    // the click lands in a field. StreamServer sends a device only a change.
+    // While a device whose hello asked for it is connected, the target app is observed (TextFocusReader:
+    // its focused element or window changed), so a field the Mac focuses by itself is told at once. Some
+    // apps post no notification (Electron, web views), so the focus is also read 0.15 s and 0.45 s after a
+    // device's click or key, and every 2 s as a safety net, which also follows a change of target the
+    // activation observer misses. StreamServer sends a device only a change.
 
     /// The app whose focus counts: the menus' target (the streamed window's app, or the Desktop's
     /// frontmost; none while locked, nothing streaming, or Sill), and only while it is frontmost, since
@@ -2912,18 +2922,34 @@ package final class StreamCoordinator {
     }
 
     /// `forcing`: the device whose click or key asked for this check, sent the answer even unchanged.
+    /// Observes the target from here on, and nothing while there is none.
     private func checkTextFocus(forcing: NWConnection? = nil) {
         guard server.hasTextFocusDevices else { return }
-        guard let pid = textFocusTarget() else { server.sendTextFocus(.none, forcing: forcing); return }
+        guard let pid = textFocusTarget() else {
+            textFocusReader.stop()
+            server.sendTextFocus(.none, forcing: forcing)
+            return
+        }
         textFocusReader.read(pid: pid) { [server] focus in server.sendTextFocus(focus, forcing: forcing) }
     }
 
     private func startTextFocusPoll() {
         guard textFocusPoll == nil else { return }
+        if appKitLoop {
+            textFocusActivation = NSWorkspace.shared.notificationCenter.addObserver(
+                forName: NSWorkspace.didActivateApplicationNotification, object: nil, queue: nil) { [weak self] _ in
+                Task { @MainActor in self?.checkTextFocus() }
+            }
+        }
         textFocusPoll = Task { @MainActor in
             while !Task.isCancelled, self.server.hasTextFocusDevices {
                 self.checkTextFocus()
-                try? await Task.sleep(for: .milliseconds(500))
+                try? await Task.sleep(for: .seconds(2))
+            }
+            self.textFocusReader.stop()
+            if let observer = self.textFocusActivation {
+                NSWorkspace.shared.notificationCenter.removeObserver(observer)
+                self.textFocusActivation = nil
             }
             self.textFocusPoll = nil
         }
